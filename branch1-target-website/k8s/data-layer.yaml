@@ -1,0 +1,443 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-names-json
+  namespace: classifier
+  labels:
+    branch: branch1-target-website
+data:
+  feature_names.json: |
+    {
+      "request_length": "integer",
+      "has_sql_keywords": "boolean",
+      "sql_keywords_found": "integer",
+      "special_chars_ratio": "float",
+      "has_xss_patterns": "boolean",
+      "xss_pattern_count": "integer",
+      "path_depth": "integer",
+      "has_directory_traversal": "boolean",
+      "request_rate_per_sec": "float",
+      "user_agent_length": "integer"
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rule-definitions
+  namespace: knowledge-base
+  labels:
+    branch: branch1-target-website
+data:
+  rules.yaml: |
+    - rule_id: R-SQLI-001
+      name: SQL Injection - Basic
+      attack_type: SQL_INJECTION
+      mitre_technique: T1190
+      mitre_tactic: TA0001
+      severity: high
+      conditions:
+        - feature: has_sql_keywords
+          operator: "=="
+          value: true
+        - feature: sql_keywords_found
+          operator: ">="
+          value: 1
+      explanation_template: "SQL injection detected. Keyword '{feature_value}' found in request."
+    
+    - rule_id: R-XSS-001
+      name: XSS - Reflected
+      attack_type: XSS
+      mitre_technique: T2001
+      mitre_tactic: TA0001
+      severity: high
+      conditions:
+        - feature: has_xss_patterns
+          operator: "=="
+          value: true
+        - feature: xss_pattern_count
+          operator: ">="
+          value: 1
+      explanation_template: "Cross-site scripting detected. Pattern '{feature_value}' found in request."
+    
+    - rule_id: R-PATHTRAV-001
+      name: Path Traversal Attempt
+      attack_type: PATH_TRAVERSAL
+      mitre_technique: T1203
+      mitre_tactic: TA0001
+      severity: medium
+      conditions:
+        - feature: has_directory_traversal
+          operator: "=="
+          value: true
+        - feature: path_depth
+          operator: ">="
+          value: 3
+      explanation_template: "Path traversal attempt detected. Depth level '{feature_value}' exceeds threshold."
+    
+    - rule_id: R-CMDINJ-001
+      name: Command Injection
+      attack_type: COMMAND_INJECTION
+      mitre_technique: T1059
+      mitre_tactic: TA0001
+      severity: critical
+      conditions:
+        - feature: special_chars_ratio
+          operator: ">="
+          value: 0.3
+      explanation_template: "Command injection possible. High special character ratio: {feature_value}."
+    
+    - rule_id: R-BRUTEFORCE-001
+      name: Brute Force Detection
+      attack_type: BRUTE_FORCE
+      mitre_technique: T1110
+      mitre_tactic: TA0001
+      severity: medium
+      conditions:
+        - feature: request_rate_per_sec
+          operator: ">="
+          value: 10
+      explanation_template: "Brute force pattern detected. Request rate: {feature_value} requests/second."
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: data-layer
+  labels:
+    branch: branch1-target-website
+spec:
+  replicas: 1
+  selector: {}
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          value: "postgres"
+        - name: POSTGRES_DB
+          value: "sentinel"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: postgres-storage
+        emptyDir: {}
+        volumeAttributes:
+          sizeLimit: 1Gi
+        nodeSelector:
+          k3s.io/agent: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: data-layer
+  labels:
+    branch: branch1-target-website
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: event-api
+  namespace: data-layer
+  labels:
+    branch: branch1-target-website
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: event-api
+  template:
+    metadata:
+      labels:
+        app: event-api
+    spec:
+      containers:
+      - name: event-api
+        image: python:3.11-slim
+        working_dir: /app
+        command: ["sh", "-c", "pip install fastapi uvicorn pydantic psycopg2-binary && python -m uvicorn main:app --host 0.0.0.0 --port 8000"]
+        env:
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@postgres.data-layer.svc.cluster.local:5432/sentinel"
+        - name: MONGODB_URI
+          valueFrom:
+            configMapKeyRef:
+              name: mongodb-placeholders
+              key: MONGODB_URI
+        ports:
+        - containerPort: 8000
+        volumeMounts:
+        - name: api-scripts
+          mountPath: /app
+      volumes:
+      - name: api-scripts
+        configMap:
+          name: event-api-scripts
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: event-api-scripts
+  namespace: data-layer
+  labels:
+    branch: branch1-target-website
+data:
+  main.py: |
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import JSONResponse
+    import psycopg2
+    import json
+    import hashlib
+    from datetime import datetime
+    
+    app = FastAPI()
+    
+    @app.post("/internal/events")
+    async def ingest_event(request: Request):
+        """Telemetry module calls this - inserts partial event (pre-classification)"""
+        try:
+            body = await request.json()
+            
+            # Validate required partial fields from §5.1
+            required = ["source_ip", "target_endpoint", "http_method", "raw_features", "action_taken"]
+            for field in required:
+                if field not in body:
+                    raise HTTPException(status_code=400, detail=f"Missing field: {field}")
+            
+            # Generate idempotent event_id
+            event_id = hashlib.sha256(
+                f"{body['source_ip']}:{body['target_endpoint']}:{body['http_method']}:{json.dumps(body['raw_features'], sort_keys=True)}".encode()
+            ).hexdigest()
+            
+            conn = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sentinel"))
+            cur = conn.cursor()
+            
+            # Idempotency check
+            cur.execute("SELECT event_id FROM security_events WHERE event_id = %s", (event_id,))
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return JSONResponse(status_code=200, content={"event_id": event_id, "duplicate": True})
+            
+            # Insert partial event
+            cur.execute(
+                """INSERT INTO security_events 
+                   (event_id, ts, source_ip, target_endpoint, http_method, raw_features, action_taken, ts)
+                   VALUES (%s, now(), %s, %s, %s, %s, %s, now())""",
+                (event_id, body["source_ip"], body["target_endpoint"],
+                 body["http_method"], json.dumps(body["raw_features"]),
+                 body["action_taken"])
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return JSONResponse(status_code=201, content={"event_id": event_id})
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.patch("/internal/events/{event_id}")
+    async def update_event(event_id: str, request: Request):
+        """Fusion module calls this - updates classification-through-explanation fields"""
+        try:
+            body = await request.json()
+            
+            # Only allow specific fields
+            allowed = ["predicted_class", "confidence", "fired_rule_ids",
+                      "mitre_technique", "mitre_tactic", "faithfulness_score",
+                      "faithfulness_verdict", "explanation_text"]
+            
+            updates = {}
+            for key, value in body.items():
+                if key in allowed:
+                    updates[key] = value
+            
+            if not updates:
+                raise HTTPException(status_code=400, detail="No valid fields to update")
+            
+            conn = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sentinel"))
+            cur = conn.cursor()
+            
+            set_clause = ", ".join([f"{k} = %s" for k in updates.keys()])
+            values = list(updates.values()) + [event_id]
+            
+            cur.execute(
+                f"""UPDATE security_events 
+                    SET {set_clause}
+                    WHERE event_id = %s""",
+                values
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return JSONResponse(status_code=200, content={"updated": True})
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.patch("/internal/events/{event_id}/ground-truth")
+    async def set_ground_truth(event_id: str, request: Request):
+        """Attack-sim module calls this - updates ground truth label only"""
+        try:
+            body = await request.json()
+            if "ground_truth_label" not in body:
+                raise HTTPException(status_code=400, detail="Missing ground_truth_label")
+            
+            valid_labels = ["BENIGN", "SQL_INJECTION", "XSS", "PATH_TRAVERSAL",
+                          "COMMAND_INJECTION", "BRUTE_FORCE", "ANOMALY_UNKNOWN"]
+            if body["ground_truth_label"] not in valid_labels:
+                raise HTTPException(status_code=400, detail="Invalid ground_truth_label")
+            
+            conn = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sentinel"))
+            cur = conn.cursor()
+            
+            cur.execute(
+                "UPDATE security_events SET ground_truth_label = %s WHERE event_id = %s",
+                (body["ground_truth_label"], event_id)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return JSONResponse(status_code=200, content={"updated": True})
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/api/v1/events")
+    async def list_events(
+        limit: int = 50,
+        type: str = None,
+        since: str = None
+    ):
+        """Dashboard GET endpoint"""
+        conn = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sentinel"))
+        cur = conn.cursor()
+        
+        query = "SELECT event_id, ts, source_ip, target_endpoint, http_method, raw_features, predicted_class, confidence, fired_rule_ids, mitre_technique, mitre_tactic, faithfulness_score, faithfulness_verdict, explanation_text, action_taken, ground_truth_label FROM security_events WHERE 1=1"
+        params = []
+        
+        if type and type != "all":
+            query += " AND predicted_class = %s"
+            params.append(type)
+        
+        if since:
+            query += " AND ts >= %s"
+            params.append(since)
+        
+        query += " ORDER BY ts DESC LIMIT %s"
+        params.append(limit)
+        
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        events = []
+        column_names = [desc[0] for desc in cur.description] if 'cur' in dir() else []
+        
+        for row in rows:
+            event = {}
+            for i, col in enumerate(column_names):
+                val = row[i]
+                if hasattr(val, 'isoformat'):
+                    event[col] = val.isoformat()
+                elif isinstance(val, list):
+                    event[col] = val
+                else:
+                    event[col] = str(val) if val is not None else None
+            events.append(event)
+        
+        return JSONResponse(content={"events": events})
+    
+    @app.get("/api/v1/events/{event_id}")
+    async def get_event(event_id: str):
+        """Dashboard GET single event"""
+        conn = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sentinel"))
+        cur = conn.cursor()
+        
+        cur.execute(
+            "SELECT event_id, ts, source_ip, target_endpoint, http_method, raw_features, predicted_class, confidence, fired_rule_ids, mitre_technique, mitre_tactic, faithfulness_score, faithfulness_verdict, explanation_text, action_taken, ground_truth_label FROM security_events WHERE event_id = %s",
+            (event_id,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Event not found")
+        
+        column_names = [desc[0] for desc in cur.description] if 'cur' in dir() else []
+        event = {}
+        for i, col in enumerate(column_names):
+            val = row[i]
+            if hasattr(val, 'isoformat'):
+                event[col] = val.isoformat()
+            elif isinstance(val, list):
+                event[col] = val
+            else:
+                event[col] = str(val) if val is not None else None
+        
+        return JSONResponse(content=event)
+    
+    @app.get("/api/v1/stats/today")
+    async def today_stats():
+        """Dashboard stats endpoint"""
+        conn = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sentinel"))
+        cur = conn.cursor()
+        
+        cur.execute(
+            """SELECT action_taken, COUNT(*) 
+               FROM security_events 
+               WHERE ts >= now() - interval '24 hours'
+               GROUP BY action_taken"""
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        stats = {"total": 0}
+        for row in rows:
+            stats[row[0]] = row[1]
+            stats["total"] += row[1]
+        
+        return JSONResponse(content=stats)
+    
+    @app.get("/api/v1/metrics")
+    async def get_metrics():
+        """Dashboard metrics endpoint - stub until Phase 11"""
+        return JSONResponse(content={
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "false_positive_rate": 0.0,
+            "faithfulness_rate": 0.0,
+            "rule_coverage": 0.0
+        })
