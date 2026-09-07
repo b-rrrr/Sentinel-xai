@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sentinel Lab — XAI / SOC Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/recharts@2.9.3/css/recharts.css" />
+  <style>
+    body { margin: 0; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; background: #f5f7fa; }
+    .navbar { background: #2c3e50; color: #white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+    .navbar h1 { margin: 0; font-size: 1.2rem; }
+    .nav-btn { background: #3498db; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+    .nav-btn:hover { background: #2980b9; }
+    .container { padding: 2rem; max-width: 1200px; margin: 0 auto; }
+    .overview-card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 2rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .stats-row { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .stat-box { flex: 1; min-width: 120px; padding: 0.75rem; border-radius: 6px; text-align: center; }
+    .stat-box.BLOCKED { background: #e74c3c; color: white; }
+    .stat-box.ALLOWED { background: #27ae60; color: white; }
+    .stat-box.MITIGATED { background: #f39c12; color: white; }
+    .stat-box.FLAGGED { background: #9b59b6; color: white; }
+    .event-list { margin-top: 1rem; }
+    .event-item { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 0.5rem; cursor: pointer; transition: border-color 0.2s; }
+    .event-item:hover { border-color: #3498db; }
+    .event-item.verified { border-left: 4px solid #27ae60; }
+    .event-item.unverified { border-left: 4px solid #f39c12; }
+    .event-item.blocked { border-left: 4px solid #e74c3c; }
+    .event-item.allowed { border-left: 4px solid #27ae60; }
+    .faithfulness-badge { 
+      display: inline-block; 
+      padding: 0.2rem 0.5rem; 
+      border-radius: 10px; 
+      font-size: 0.7rem; 
+      font-weight: bold;
+    }
+    .badge-verified { background: #27ae60; color: white; }
+    .badge-unverified { background: #f39c12; color: white; }
+    .badge-badge { background: #9b59b6; color: white; }
+    .badge-allowed { background: #27ae60; color: white; }
+    .badge-mitigated { background: #f39c12; color: white; }
+    .badge-flagged { background: #9b59b6; color: white; }
+    .detail-view { background: white; border-radius: 8px; padding: 2rem; margin-top: 2rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: none; }
+    .detail-view.active { display: block; }
+    .close-detail { float: right; cursor: pointer; font-weight: bold; }
+    .chart-container { height: 150px; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="navbar">
+    <h1>Sentinel Lab — XAI / SOC Dashboard</h1>
+    <button class="nav-btn" onclick="sendTemplate()">Send Template → Laptop</button>
+  </div>
+  
+  <div class="container">
+    <div id="overview" class="overview-card">
+      <div class="stats-row" id="stats-container">
+        <!-- Stats injected by JS -->
+      </div>
+      <div class="event-list" id="event-list">
+        <!-- Events injected by JS -->
+      </div>
+    </div>
+    
+    <div id="detail" class="detail-view">
+      <span class="close-detail" onclick="hideDetail()">&times;</span>
+      <h2>Event Details</h2>
+      <div id="event-detail-content">
+        <!-- Detail content injected by JS -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Recharts library -->
+  <script src="https://unpkg.com/recharts@2.9.3/dist/recharts.min.js"></script>
+  <!-- React -->
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  
+  <script type="text/babel">
+    // Dashboard Application
+    class Dashboard extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = {
+          events: [],
+          stats: { total: 0, BLOCKED: 0, ALLOWED: 0, MITIGATED: 0, FLAGGED: 0 },
+          selectedEvent: null,
+          isDetailOpen: false,
+          faithfulnessSent: false,
+          laptopIp: ""
+        };
+        this.xhr = null;
+      }
+      
+      componentDidMount() {
+        this.fetchStats();
+        this.fetchEvents();
+      }
+      
+      fetchStats = async () => {
+        try {
+          const res = await fetch("/api/v1/stats/today");
+          const data = await res.json();
+          this.setState({ stats: data });
+        } catch (e) {
+          console.error("Failed to fetch stats:", e);
+          // Show not-yet-computed state
+          this.setState({ stats: { total: 0, BLOCKED: 0, ALLOWED: 0, MITIGATED: 0, FLAGGED: 0, computing: true } });
+        }
+      };
+      
+      fetchEvents = async (typeFilter = null, sinceFilter = null) => {
+        let url = "/api/v1/events?limit=20&type=all";
+        if (typeFilter) url += `&type=${typeFilter}`;
+        if (sinceFilter) url += `&since=${sinceFilter}`;
+        
+        try {
+          const res = await fetch(url);
+          const data = await res.json();
+          this.setState({ events: data.events || [] });
+        } catch (e) {
+          console.error("Failed to fetch events:", e);
+        }
+      };
+      
+      selectEvent = (event) => {
+        this.setState({ selectedEvent: event, isDetailOpen: true });
+      };
+      
+      hideDetail = () => {
+        this.setState({ selectedEvent: null, isDetailOpen: false, faithfulnessSent: false });
+      };
+      
+      sendTemplate = () => {
+        if (!this.state.selectedEvent) {
+          alert("Please select an event first");
+          return;
+        }
+        
+        const event = this.state.selectedEvent;
+        const laptopIp = prompt("Enter RTX 5060 laptop IP address:", this.state.laptopIp || "");
+        if (!laptopIp) return;
+        
+        this.setState({ laptopIp });
+        
+        // Prepare data to send
+        const payload = {
+          events: [{
+            event_id: event.event_id,
+            source_ip: event.source_ip,
+            target_endpoint: event.target_endpoint,
+            http_method: event.http_method,
+            raw_features: event.raw_features || {},
+            predicted_class: event.predicted_class,
+            confidence: event.confidence,
+            ground_truth_label: event.ground_truth_label,
+            fired_rule_ids: event.fired_rule_ids || [],
+            mitre_technique: event.mitre_technique,
+            mitre_tactic: event.mitre_tactic,
+            faithfulness_score: event.faithfulness_score,
+            faithfulness_verdict: event.faithfulness_verdict,
+            explanation_text: event.explanation_text,
+            action_taken: event.action_taken,
+            ts: event.ts
+          }]
+        };
+        
+        // Send to laptop
+        fetch(`http://${laptopIp}:8000/receive-training-data`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        })
+        .then(res => res.json())
+        .then(data => {
+          if (data.status === "training_data_received") {
+            this.setState({ faithfulnessSent: true });
+            alert(`Template sent successfully! ${data.count} event(s) received by laptop.`);
+          } else {
+            alert("Failed to send template. Check laptop IP and server status.");
+          }
+        })
+        .catch(err => {
+          console.error("Send template error:", err);
+          alert("Network error. Ensure laptop is reachable and inference server is running.");
+        });
+      };
+      
+      renderEventItem = (event) => {
+        const verdictClass = event.faithfulness_verdict;
+        const verdictLabel = verdictClass === "verified" ? "Verified" : 
+                           verdictClass === "unverified" ? "Unverified" : "N/A";
+        const verdictColor = verdictClass === "verified" ? "badge-verified" :
+                             verdictClass === "unverified" ? "badge-unverified" : "badge-badge";
+        
+        const actionClass = event.action_taken;
+        const actionColor = actionClass === "BLOCKED" ? "badge-allowed" :
+                           actionClass === "ALLOWED" ? "badge-allowed" :
+                           actionClass === "MITIGATED" ? "badge-mitigated" : "badge-flagged";
+        
+        return React.createElement("div", {
+          className: `event-item ${verdictClass || "verified"} ${actionClass || "allowed"}`,
+          onClick: () => this.selectEvent(event)
+        }, 
+          React.createElement("div", { className: "faithfulness-badge badge-verified" }, 
+            `${event.predicted_class}: ${verdictLabel}`
+          ),
+          React.createElement("div", null, 
+            `IP: ${event.source_ip} → ${event.target_endpoint} (${event.http_method})`
+          ),
+          React.createElement("div", { className: `badge-badge ${actionClass || "allowed"}` }, 
+            `${event.action_taken}`
+          )
+        );
+      };
+      
+      renderEventDetail = (event) => {
+        const verdict = event.faithfulness_verdict;
+        const verdictDisplay = verdict === "verified" ? "Verified ✓" :
+                              verdict === "unverified" ? "Unverified - Fallback Attribution" : "N/A";
+        const verdictStyle = verdict === "verified" ? {color: "#27ae60"} :
+                            verdict === "unverified" ? {color: "#f39c12"} : {color: "#95a5a6"};
+        
+        const actionDisplay = event.action_taken === "BLOCKED" ? "Blocked" :
+                             event.action_taken === "ALLOWED" ? "Allowed" :
+                             event.action_taken === "MITIGATED" ? "Mitigated" : "Flagged";
+        
+        // Render feature chart if we have attributed features
+        let chartNodes = null;
+        if (event.raw_features && Object.keys(event.raw_features).length > 0) {
+          const topFeatures = Object.entries(event.raw_features)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5);
+          
+          chartNodes = React.createElement("div", { className: "chart-container" },
+            React.createElement("h3", null, "Top Attributed Features"),
+            React.createElement("div", null, 
+              topFeatures.map(([name, value], i) => 
+                React.createElement("div", {
+                  key: i, 
+                  style: { display: "flex", justifyContent: "space-between", marginBottom: "0.5rem" }
+                }, 
+                  React.createElement("span", null, name),
+                  React.createElement("span", { style: { width: `${value * 100}%` } }, `${value:.2f}`)
+                )
+              )
+            )
+          );
+        }
+        
+        return React.createElement("div", null,
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            React.createElement("span", { style: { ...verdictStyle, fontWeight: "bold", marginRight: "1rem" } }, 
+              `Faithfulness: ${verdictDisplay}`
+            )
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Event ID: ${event.event_id}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Timestamp: ${event.ts || "N/A"}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Source IP: ${event.source_ip || "N/A"}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Target: ${event.target_endpoint || "N/A"}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `HTTP Method: ${event.http_method || "N/A"}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Action Taken: ${actionDisplay}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Predicted Class: ${event.predicted_class || "N/A"}`
+          ),
+          event.confidence !== undefined && React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Confidence: ${event.confidence:.4f}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `MITRE Technique: ${event.mitre_technique || "N/A"}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `MITRE Tactic: ${event.mitre_tactic || "N/A"}`
+          ),
+          event.fired_rule_ids && event.fired_rule_ids.length > 0 && React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Fired Rule IDs: ${event.fired_rule_ids.join(", ")}`
+          ),
+          React.createElement("div", { style: { marginBottom: "1rem" } },
+            `Explanation: ${event.explanation_text || "N/A"}`
+          ),
+          chartNodes
+        );
+      };
+      
+      render() {
+        const { events, stats, selectedEvent, isDetailOpen, faithfulnessSent } = this.state;
+        
+        // Render stats with computed state handling
+        let statsNodes = null;
+        if (stats.computing) {
+          statsNodes = React.createElement("div", null,
+            React.createElement("p", null, "Computing metrics...")
+          );
+        } else {
+          statsNodes = React.createElement("div", { className: "stats-row" },
+            React.createElement("div", { className: "stat-box BLOCKED" }, stats.BLOCKED || 0),
+            React.createElement("div", { className: "stat-box ALLOWED" }, stats.ALLOWED || 0),
+            React.createElement("div", { className: "stat-box MITIGATED" }, stats.MITIGATED || 0),
+            React.createElement("div", { className: "stat-box FLAGGED" }, stats.FLAGGED || 0),
+            React.createElement("div", { className: "stat-box" }, `Total: ${stats.total || 0}`)
+          );
+        }
+        
+        // Render events list
+        let eventsNodes = null;
+        if (events.length === 0) {
+          eventsNodes = React.createElement("div", null,
+            React.createElement("p", null, "No events found. Attacks will appear here as they are logged to the database.")
+          );
+        } else {
+          eventsNodes = React.createElement("div", null, 
+            events.map((event, i) => 
+              this.renderEventItem(event)
+            )
+          );
+        }
+        
+        // Render detail view if open
+        let detailNodes = null;
+        if (isDetailOpen && selectedEvent) {
+          detailNodes = React.createElement("div", { className: "detail-view active" },
+            React.createElement("span", { className: "close-detail", onClick: this.hideDetail }, "×"),
+            this.renderEventDetail(selectedEvent)
+          );
+        }
+        
+        return React.createElement("div", null,
+          React.createElement("div", { className: "overview-card" }, 
+            statsNodes,
+            React.createElement("h3", null, "Recent Security Events"),
+            eventsNodes
+          ),
+          detailNodes
+        );
+      }
+    }
+    
+    // Render the dashboard
+    ReactDOM.render(React.createElement(Dashboard), document.getElementById("root"));
+  </script>
+</body>
+</html>
