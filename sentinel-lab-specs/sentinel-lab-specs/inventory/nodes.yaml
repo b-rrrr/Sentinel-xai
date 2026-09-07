@@ -1,0 +1,26 @@
+# Fill this in during specs/01-infrastructure.md Phase 0, with REAL measured values.
+# Do not estimate or copy numbers from any other document — run:
+#   free -h; lscpu | grep -E "Model name|CPU\(s\)"; lsblk; ip -br a
+# on each physical machine and paste the real output here.
+
+nodes:
+  - name: ""            # e.g. sentinel-xeon-1
+    hardware: ""        # e.g. "Intel Xeon E5-2650 v2"
+    ram_gb: null        # real number from `free -h`
+    disk_gb: 250        # confirmed for the two Xeons; leave null for the laptop until measured
+    tier: null           # 1, 2, or 3 — assign per 00-ARCHITECTURE.md §8, highest RAM+disk = tier 1
+    static_ip: ""
+
+  - name: ""            # second Xeon
+    hardware: ""
+    ram_gb: null
+    disk_gb: 250
+    tier: null
+    static_ip: ""
+
+  - name: ""            # Dell Pentium laptop (currently Fedora — reformat to Ubuntu Server LTS)
+    hardware: ""
+    ram_gb: null
+    disk_gb: null
+    tier: null           # expected tier 3 (least capable) — confirm after measuring, don't assume
+    static_ip: ""

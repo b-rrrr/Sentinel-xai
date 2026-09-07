@@ -1,0 +1,10 @@
+# Requirements for ML/Training Branch (branch2-ml-training)
+# Install with: pip install -r requirements_ml.txt
+
+tensorflow>=2.15.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.27.0
+numpy>=1.24.0
+pandas>=2.1.0
+psycopg2-binary>=2.9.0
+pydantic>=2.5.0
