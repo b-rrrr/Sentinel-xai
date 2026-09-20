@@ -1,0 +1,428 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coraza-rules
+  namespace: telemetry
+  labels:
+    branch: branch1-target-website
+data:
+  crs-set.yaml: |
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: coraza-crs
+    data:
+      0001-allow-all.conf: |
+        SecRuleEngine On
+        SecRequestBodyAccess On
+        SecResponseBodyAccess On
+        SecDefaultAction "pass,log,audit"
+      0000-oras-core.rules: |
+        SecRule REQ_URI "/login" "id:R-SQLI-001,tag:injection,phase:1,log"
+        SecRule ARGS "(?:union.*select|select.*from|insert.*into|delete.*from|drop.*table|alter.*table|exec.*execute|xp_cmdshell|sp_executesql)" "id:R-SQLI-002,tag:injection,severity:critical,phase:1"
+      0001-xss-core.rules: |
+        SecRule ARGS "(?:<script>|</script>|alert\(|onerror=|onload=|javascript:|onmouseover)" "id:R-XSS-001,tag:xss,severity:high,phase:1"
+      0002-path-traversal.rules: |
+        SecRule ARGS "(?:\.\./|..\\|%2e%2e|%2f%2e%2e)" "id:R-PATHTRAV-001,tag:path-traversal,severity:medium,phase:1"
+      0003-cmd-injection.rules: |
+        SecRule ARGS "(?:\||;|&|`|\(|\\)|&&|\|\|)" "id:R-CMDINJ-001,tag:command-injection,severity:high,phase:1"
+      0004-brute-force.rules: |
+        SecRule "@ip.contains" "127\.0\.0\.1" "id:R-BRUTEFORCE-001,tag:brute-force,severity:medium,phase:1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluent-bit
+  namespace: telemetry
+  labels:
+    branch: branch1-target-website
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:latest
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "50m"
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: fluent-bit-config
+          mountPath: /fluent-bit
+        env:
+        - name: TELEMETRY_INGEST_URL
+          value: "http://telemetry-ingest.telemetry.svc.cluster.local:8080/ingest"
+      - name: telemetry-ingest
+        image: python:3.11-slim
+        resources:
+          limits:
+            memory: "256Mi"
+            cpu: "100m"
+        env:
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@postgres.data-layer.svc.cluster.local:5432/sentinel"
+        - name: MONGODB_URI
+          valueFrom:
+            configMapKeyRef:
+              name: mongodb-placeholders
+              key: MONGODB_URI
+        working_dir: /app
+        command: ["sh", "-c", "pip install fastapi uvicorn pydantic && python -m uvicorn main:app --host 0.0.0.0 --port 8080"]
+        volumeMounts:
+        - name: ingest-script
+          mountPath: /app
+        ports:
+        - containerPort: 8080
+      volumes:
+      - name: fluent-bit-config
+        configMap:
+          name: fluent-bit-config
+      - name: ingest-script
+        configMap:
+          name: ingest-python-scripts
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: telemetry
+  labels:
+    branch: branch1-target-website
+data:
+  fluent-bit.conf: |
+    [INPUT]
+      name tail
+      Path /var/log/containers/juice-shop/*.log
+      tag juice-shop.*
+      parse As_json
+      json_key_time stamp ts
+      json_key_source_ip source_ip
+      json_key_http_method method
+      json_key_target_endpoint path
+      json_key_http_status status_code
+      json_key_raw_features raw_features
+      MemBufMaxSize 5MB
+    
+    [OUTPUT]
+      Name remote_write
+      Match *
+      url http://telemetry-ingest.telemetry.svc.cluster.local:8080/ingest
+      format json
+      with_own_termination_tag false
+    
+    [OUTPUT]
+      Name console
+      Match *
+    
+    [INPUT]
+      name prometheus
+      port 24224
+      bind 0.0.0.0
+    
+    [OUTPUT]
+      name health_check
+      tag health
+    
+    [FILTER]
+      name parser
+      match *
+    
+    [FILTER]
+      name shift
+      match *
+    
+    [OUTPUT]
+      name S3
+      Match *
+    
+    [OUTPUT]
+      name elasticsearch
+      Match *
+      hosts ["elasticsearch.data-layer.svc.cluster.local:9200"]
+      index_name sentinel-lab
+      type_name _doc
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingest-python-scripts
+  namespace: telemetry
+  labels:
+    branch: branch1-target-website
+data:
+  main.py: |
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import JSONResponse
+    import psycopg2
+    import json
+    import hashlib
+    from datetime import datetime
+    
+    app = FastAPI()
+    
+    # Database connection
+    def get_db_connection():
+        import os
+        dsn = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sentinel")
+        return psycopg2.connect(dsn)
+    
+    @app.post("/ingest")
+    async def ingest_event(request: Request):
+        try:
+            body = await request.json()
+            # Normalize to partial security_event shape
+            event = {
+                "source_ip": body.get("source_ip", "0.0.0.0"),
+                "target_endpoint": body.get("target_endpoint", "/"),
+                "http_method": body.get("http_method", "GET"),
+                "raw_features": body.get("raw_features", {}),
+                "action_taken": body.get("action_taken", "ALLOWED"),
+                "ts": datetime.utcnow().isoformat() + "Z"
+            }
+            
+            # Idempotency check - hash based on source_ip + target_endpoint + method
+            event_id = hashlib.sha256(
+                f"{event['source_ip']}:{event['target_endpoint']}:{event['http_method']}".encode()
+            ).hexdigest()[:8]
+            
+            # Store in PostgreSQL
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            # Check if event already exists (idempotency)
+            cur.execute(
+                "SELECT event_id FROM security_events WHERE event_id = %s",
+                (event_id,)
+            )
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return JSONResponse(status_code=200, content={"event_id": event_id, "duplicate": True})
+            
+            # Insert event
+            cur.execute(
+                """INSERT INTO security_events 
+                   (event_id, source_ip, target_endpoint, http_method, raw_features, action_taken, ts)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (event_id, event["source_ip"], event["target_endpoint"], 
+                 event["http_method"], json.dumps(event["raw_features"]), 
+                 event["action_taken"], event["ts"])
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return JSONResponse(status_code=201, content={"event_id": event_id, "duplicate": False})
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/internal/events")
+    async def internal_events(request: Request):
+        """Telemetry endpoint - receives partial security_event from WAF"""
+        try:
+            body = await request.json()
+            # Validate required fields from §5.1 (partial - pre-classification)
+            required = ["source_ip", "target_endpoint", "http_method", "raw_features", "action_taken"]
+            for field in required:
+                if field not in body:
+                    raise HTTPException(status_code=400, detail=f"Missing field: {field}")
+            
+            # Generate event_id for idempotency
+            event_id = body.get("event_id", hashlib.sha256(
+                f"{body['source_ip']}:{body['target_endpoint']}:{body['http_method']}".encode()
+            ).hexdigest()[:8])
+            
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            # Check idempotency
+            cur.execute("SELECT event_id FROM security_events WHERE event_id = %s", (event_id,))
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return JSONResponse(status_code=200, content={"event_id": event_id, "duplicate": True})
+            
+            # Insert partial event
+            cur.execute(
+                """INSERT INTO security_events 
+                   (event_id, source_ip, target_endpoint, http_method, raw_features, action_taken, ts)
+                   VALUES (%s, %s, %s, %s, %s, %s, now())""",
+                (event_id, body["source_ip"], body["target_endpoint"],
+                 body["http_method"], json.dumps(body["raw_features"]),
+                 body["action_taken"])
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return JSONResponse(status_code=201, content={"event_id": event_id})
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.patch("/internal/events/{event_id}")
+    async def update_event(event_id: str, request: Request):
+        """Fusion endpoint - updates classification-through-explanation fields"""
+        try:
+            body = await request.json()
+            # Only allow specific fields to be updated
+            allowed_fields = ["predicted_class", "confidence", "fired_rule_ids", 
+                            "mitre_technique", "mitre_tactic", "faithfulness_score",
+                            "faithfulness_verdict", "explanation_text"]
+            
+            updates = {}
+            for key, value in body.items():
+                if key in allowed_fields:
+                    updates[key] = value
+            
+            if not updates:
+                raise HTTPException(status_code=400, detail="No valid fields to update")
+            
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            # Build dynamic update query
+            set_clause = ", ".join([f"{k} = %s" for k in updates.keys()])
+            values = list(updates.values()) + [event_id]
+            
+            cur.execute(
+                f"""UPDATE security_events 
+                    SET {set_clause}
+                    WHERE event_id = %s""",
+                values
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return JSONResponse(status_code=200, content={"updated": True})
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.patch("/internal/events/{event_id}/ground-truth")
+    async def set_ground_truth(event_id: str, request: Request):
+        """Attack-sim endpoint - updates ground truth label only"""
+        try:
+            body = await request.json()
+            if "ground_truth_label" not in body:
+                raise HTTPException(status_code=400, detail="Missing ground_truth_label")
+            
+            valid_labels = ["BENIGN", "SQL_INJECTION", "XSS", "PATH_TRAVERSAL", 
+                          "COMMAND_INJECTION", "BRUTE_FORCE", "ANOMALY_UNKNOWN"]
+            if body["ground_truth_label"] not in valid_labels:
+                raise HTTPException(status_code=400, detail="Invalid ground_truth_label")
+            
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            cur.execute(
+                "UPDATE security_events SET ground_truth_label = %s WHERE event_id = %s",
+                (body["ground_truth_label"], event_id)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return JSONResponse(status_code=200, content={"updated": True})
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/api/v1/events")
+    async def list_events(
+        limit: int = 50,
+        type: str = None,
+        since: str = None
+    ):
+        """Dashboard endpoint - paginated list of events"""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        query = "SELECT * FROM security_events WHERE 1=1"
+        params = []
+        
+        if type and type != "all":
+            query += " AND predicted_class = %s"
+            params.append(type)
+        
+        if since:
+            query += " AND ts >= %s"
+            params.append(since)
+        
+        query += " ORDER BY ts DESC LIMIT %s OFFSET 0"
+        params.append(limit)
+        
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        events = []
+        for row in rows:
+            events.append({
+                "event_id": str(row[0]),
+                "ts": row[1].isoformat() if hasattr(row[1], 'isoformat') else str(row[1]),
+                "source_ip": str(row[2]),
+                "target_endpoint": str(row[3]),
+                "http_method": str(row[4]),
+                "raw_features": row[5] if row[5] else {},
+                "predicted_class": str(row[6]) if row[6] else None,
+                "confidence": float(row[7]) if row[7] else None,
+                "fired_rule_ids": row[8] if row[8] else [],
+                "mitre_technique": str(row[9]) if row[9] else None,
+                "mitre_tactic": str(row[10]) if row[10] else None,
+                "faithfulness_score": float(row[11]) if row[11] else None,
+                "faithfulness_verdict": str(row[12]) if row[12] else None,
+                "explanation_text": str(row[13]) if row[13] else None,
+                "action_taken": str(row[14]) if row[14] else None,
+                "ground_truth_label": str(row[15]) if row[15] else None
+            })
+        
+        return JSONResponse(content={"events": events, "total": len(events)})
+    
+    @app.get("/api/v1/stats/today")
+    async def today_stats():
+        """Dashboard endpoint - counts by action_taken for today"""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute(
+            """SELECT action_taken, COUNT(*) 
+               FROM security_events 
+               WHERE ts >= now() - interval '24 hours'
+               GROUP BY action_taken"""
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        stats = {"total": 0}
+        for row in rows:
+            stats[row[0]] = row[1]
+            stats["total"] += row[1]
+        
+        return JSONResponse(content=stats)
+    
+    @app.get("/api/v1/metrics")
+    async def metrics():
+        """Dashboard endpoint - rolling metrics (stub until Phase 11)"""
+        return JSONResponse(content={
+            "accuracy": None,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "false_positive_rate": None,
+            "faithfulness_rate": None,
+            "rule_coverage": None
+        })

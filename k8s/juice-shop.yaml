@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: juice-shop
+  namespace: demo-app
+  labels:
+    app: juice-shop
+    branch: branch1-target-website
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: juice-shop
+  template:
+    metadata:
+      labels:
+        app: juice-shop
+      annotations:
+        # Log structured JSON with required fields
+        container logging.conf: |
+          [TYPE: json]
+          Advertise: standard
+          File: /var/log/containers/juice-shop/{pod_name}.log
+          JSON Key: timestamp
+          JSON Key: source_ip
+          JSON Key: http_method
+          JSON Key: request_url
+          JSON Key: status_code
+          JSON Key: request_body
+    spec:
+      containers:
+      - name: juice-shop
+        image: bkimminich/juice-shop:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: MONGODB_URI
+          value: "mongodb://admin:password@mongo-service.data-layer.svc.cluster.local:27017/sentinel_lab?authSource=admin"
+        - name: API_DATABASE
+          value: "postgresql://postgres:postgres@postgres.data-layer.svc.cluster.local:5432/sentinel"
+        - name: WAFFLE_ENABLED
+          value: "true"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: juice-shop
+  namespace: demo-app
+  labels:
+    app: juice-shop
+spec:
+  selector:
+    app: juice-shop
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: juice-shop-ingress
+  namespace: demo-app
+  labels:
+    branch: branch1-target-website
+spec:
+  entryPoints:
+    - web
+  routes:
+  - match: Host(`shop.lab.internal`)
+    kind: Rule
+    services:
+      name: juice-shop
+      port: 80
+  tls: {}
+  # Internal-only, no public DNS
+  # Self-signed cert acceptable for lab environment
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: juice-shop-logging
+  namespace: demo-app
+  labels:
+    branch: branch1-target-website
+data:
+  fluent-bit.conf: |
+    [INPUT]
+      FluentBit.Tag ws://127.0.0.1:24224 fluent_bit
+      Tag *
+      Severity info
+      Parser json
+      bind 0.0.0.0
+      Port 24224
+    [OUTPUT]
+      Name es
+      Match *
+      Host elasticsearch.data-layer.svc.cluster.local
+      Port 9200
+      Index sentinel-lab
+      Type json
+    [FILTER]
+      name parser
+      match *
+      Key_Name json
+      remove_key_name On
+    [PARSER]
+      Name json
+      key_name log
+      reserve_data true
+    
+    [INPUT]
+      name tail
+      Path /var/log/juice-shop/access.log
+      tag juice-shop.access
+      parse As_json
+      json_key_time stamp ts
+      json_key_source_ip source_ip
+      json_key_http_method method
+      json_key_target_endpoint path
+      json_key_http_status status_code
+      json_key_raw_features raw_features
+      MemBufMaxSize 5MB
+    
+    [OUTPUT]
+      Name remote_write
+      Match *
+      url http://telemetry-ingest.telemetry.svc.cluster.local:8080/ingest
+      format json
+      with_own_termination_tag false
